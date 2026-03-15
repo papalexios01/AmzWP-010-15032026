@@ -3789,12 +3789,7 @@ export const fetchPostsFromWordPressAPI = async (
     normalizedUrl = 'https://' + normalizedUrl;
   }
 
-  const allPosts: BlogPost[] = [];
   const perPage = 100;
-  let currentPage = 1;
-  let totalPages = 1;
-  let totalPosts = 0;
-
   const apiBase = normalizedUrl.replace(/\/$/, '') + '/wp-json/wp/v2';
 
   const headers: Record<string, string> = {
@@ -3805,102 +3800,130 @@ export const fetchPostsFromWordPressAPI = async (
     headers['Authorization'] = `Basic ${auth}`;
   }
 
-  const fetchPage = async (pageUrl: string): Promise<Response> => {
+  let useProxy = false;
+
+  const fetchWpPage = async (pageUrl: string): Promise<{ posts: any[]; totalPages: number; totalPosts: number }> => {
+    const tryDirect = async (): Promise<{ posts: any[]; totalPages: number; totalPosts: number }> => {
+      const response = await fetchWithTimeout(pageUrl, 15000, { headers, mode: 'cors' });
+      if (!response.ok) {
+        if (response.status === 400) return { posts: [], totalPages: 0, totalPosts: 0 };
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const tpHeader = response.headers.get('X-WP-TotalPages');
+      const ttHeader = response.headers.get('X-WP-Total');
+      const posts = await response.json();
+      return {
+        posts: Array.isArray(posts) ? posts : [],
+        totalPages: tpHeader ? parseInt(tpHeader, 10) : 0,
+        totalPosts: ttHeader ? parseInt(ttHeader, 10) : 0,
+      };
+    };
+
+    const tryProxy = async (): Promise<{ posts: any[]; totalPages: number; totalPosts: number }> => {
+      const proxyText = await fetchWithSmartProxy(pageUrl, { timeout: 25000 });
+      let parsed: any;
+      try { parsed = JSON.parse(proxyText); } catch { throw new Error('Invalid JSON from proxy'); }
+      if (parsed && parsed.contents) {
+        try { parsed = JSON.parse(parsed.contents); } catch { /* use as-is */ }
+      }
+      const posts = Array.isArray(parsed) ? parsed : [];
+      return { posts, totalPages: 0, totalPosts: 0 };
+    };
+
+    if (useProxy) {
+      return tryProxy();
+    }
+
     try {
-      const directResponse = await fetchWithTimeout(pageUrl, 15000, {
-        headers,
-        mode: 'cors',
-      });
-      if (directResponse.ok) return directResponse;
-      throw new Error(`HTTP ${directResponse.status}`);
+      return await tryDirect();
     } catch {
-      const proxyText = await fetchWithSmartProxy(pageUrl, { timeout: 20000 });
-      const parsed = JSON.parse(proxyText);
-      return new Response(JSON.stringify(parsed), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      useProxy = true;
+      return tryProxy();
     }
   };
 
-  try {
-    while (currentPage <= totalPages) {
-      const url = `${apiBase}/posts?page=${currentPage}&per_page=${perPage}&_embed=false`;
+  const postTypes = ['posts', 'pages'];
+  const allPosts: BlogPost[] = [];
+  const seenIds = new Set<number>();
+  let grandTotal = 0;
 
-      let posts: any[];
+  for (const postType of postTypes) {
+    let currentPage = 1;
+    let totalPages = 1;
+    let totalForType = 0;
+    let consecutiveEmpty = 0;
+
+    while (currentPage <= totalPages) {
+      const url = `${apiBase}/${postType}?page=${currentPage}&per_page=${perPage}&_embed=false&orderby=date&order=desc`;
 
       try {
-        const response = await fetchPage(url);
-        if (!response.ok) {
-          if (response.status === 400 && currentPage > 1) break;
-          throw new Error(`WordPress API error: ${response.status}`);
-        }
+        const result = await fetchWpPage(url);
 
         if (currentPage === 1) {
-          const totalPagesHeader = response.headers.get('X-WP-TotalPages');
-          const totalPostsHeader = response.headers.get('X-WP-Total');
-          if (totalPagesHeader) totalPages = parseInt(totalPagesHeader, 10);
-          if (totalPostsHeader) totalPosts = parseInt(totalPostsHeader, 10);
+          if (result.totalPages > 0) {
+            totalPages = result.totalPages;
+            totalForType = result.totalPosts;
+            grandTotal += totalForType;
+          } else if (result.posts.length > 0) {
+            totalPages = 999;
+            totalForType = result.posts.length;
+          }
         }
 
-        posts = await response.json();
+        if (result.posts.length === 0) {
+          consecutiveEmpty++;
+          if (consecutiveEmpty >= 2 || totalPages < 999) break;
+          currentPage++;
+          continue;
+        }
+
+        consecutiveEmpty = 0;
+
+        for (const post of result.posts) {
+          const postId = post.id;
+          if (seenIds.has(postId)) continue;
+          seenIds.add(postId);
+
+          const { priority, type, status } = calculatePostPriority(
+            post.title?.rendered || '',
+            post.content?.rendered || ''
+          );
+
+          allPosts.push({
+            id: postId,
+            title: decodeHtmlEntities(post.title?.rendered || 'Untitled'),
+            url: post.link || '',
+            postType: post.type || postType.replace(/s$/, ''),
+            priority,
+            monetizationStatus: status,
+          });
+        }
+
+        if (onProgress) {
+          onProgress(allPosts.length, grandTotal || allPosts.length);
+        }
+
+        if (result.posts.length < perPage && totalPages === 999) {
+          break;
+        }
+
+        currentPage++;
+
+        if (currentPage <= totalPages) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
       } catch {
-        const proxyText = await fetchWithSmartProxy(url, { timeout: 20000 });
-        try {
-          posts = JSON.parse(proxyText);
-        } catch {
-          throw new Error('Failed to parse WordPress API response');
-        }
-
-        if (currentPage === 1 && Array.isArray(posts)) {
-          totalPages = Math.max(1, Math.ceil(posts.length / perPage));
-          totalPosts = posts.length;
-        }
-      }
-
-      if (!Array.isArray(posts) || posts.length === 0) {
+        if (currentPage > 1) break;
         break;
       }
-
-      for (const post of posts) {
-        const { priority, type, status } = calculatePostPriority(
-          post.title?.rendered || '',
-          post.content?.rendered || ''
-        );
-
-        allPosts.push({
-          id: post.id,
-          title: decodeHtmlEntities(post.title?.rendered || 'Untitled'),
-          url: post.link || '',
-          postType: post.type || 'post',
-          priority,
-          monetizationStatus: status,
-        });
-      }
-
-      if (onProgress) {
-        onProgress(allPosts.length, totalPosts || allPosts.length);
-      }
-
-      currentPage++;
-
-      if (currentPage <= totalPages) {
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
     }
-
-    if (allPosts.length === 0) {
-      throw new Error('No posts found. Make sure this is a WordPress site with published posts.');
-    }
-
-    return allPosts;
-
-  } catch (error: any) {
-    if (allPosts.length > 0) {
-      return allPosts;
-    }
-    throw new Error(`Failed to fetch posts from WordPress: ${error.message}`);
   }
+
+  if (allPosts.length === 0) {
+    throw new Error('No posts found. Make sure this is a WordPress site with published posts.');
+  }
+
+  return allPosts;
 };
 
 
