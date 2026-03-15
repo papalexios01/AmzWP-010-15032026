@@ -84,7 +84,7 @@ export const SitemapScanner: React.FC<SitemapScannerProps> = ({
         lastScanned: Date.now(),
       });
     }
-  }, [posts, sitemapUrl]);
+  }, [posts, sitemapUrl, onStateChange]);
 
   // ========== FILTERED POSTS ==========
   const filteredPosts = useMemo(() => {

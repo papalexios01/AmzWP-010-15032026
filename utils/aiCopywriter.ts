@@ -108,8 +108,7 @@ export const enhanceProductCopy = async (
         : (product.faqs || []),
       urgencyHook: parsed.urgencyHook || '',
     };
-  } catch (error) {
-    void error;
+  } catch {
     return {
       verdict: product.verdict || '',
       headline: product.title || '',

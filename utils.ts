@@ -320,8 +320,6 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const CACHE_TTL_SHORT_MS = 60 * 60 * 1000; // 1 hour for volatile data
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
-const MAX_CONCURRENT_REQUESTS = 10;
-const SITEMAP_FETCH_TIMEOUT_MS = 20000;
 const PAGE_FETCH_TIMEOUT_MS = 15000;
 const API_TIMEOUT_MS = 30000;
 
@@ -480,11 +478,9 @@ const fetchWithTimeout = async (url: string, timeout: number, options: RequestIn
 export const fetchWithSmartProxy = async (url: string, options: { timeout?: number } = {}): Promise<string> => {
   const { timeout = 20000 } = options;
   const sortedProxies = getSortedProxies();
-  const errors: string[] = [];
 
-  // Try direct fetch first (for same-origin or CORS-enabled sites)
   try {
-    const response = await fetchWithTimeout(url, 8000, {
+    const response = await fetchWithTimeout(url, 6000, {
       headers: { 'Accept': 'text/xml, application/xml, text/html, */*' },
       mode: 'cors',
     });
@@ -494,48 +490,49 @@ export const fetchWithSmartProxy = async (url: string, options: { timeout?: numb
         return text;
       }
     }
-  } catch (e: any) {
-    // Direct fetch failed, will try proxies
+  } catch {
+    // Direct fetch failed, race proxies
   }
 
-  // Try each proxy
-  for (const proxy of sortedProxies) {
+  const tryProxy = async (proxy: typeof sortedProxies[0]): Promise<string> => {
     const startTime = Date.now();
-    try {
-      const proxyUrl = proxy.transform(url);
+    const proxyUrl = proxy.transform(url);
+    const response = await fetchWithTimeout(proxyUrl, proxy.timeout || timeout, {
+      headers: { 'Accept': 'text/xml, application/xml, text/html, application/json, */*' },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    let text = await response.text();
+    if ((proxy as any).parseJson && text.startsWith('{')) {
+      try {
+        const json = JSON.parse(text);
+        text = json.contents || json.data || text;
+      } catch { /* keep raw text */ }
+    }
+    if (!text || text.length < 50) throw new Error('Empty response');
+    const latency = Date.now() - startTime;
+    proxyLatencyMap.set(proxy.name, latency);
+    proxyFailureCount.set(proxy.name, 0);
+    proxySuccessCount.set(proxy.name, (proxySuccessCount.get(proxy.name) ?? 0) + 1);
+    return text;
+  };
 
-      const response = await fetchWithTimeout(proxyUrl, proxy.timeout || timeout, {
-        headers: { 'Accept': 'text/xml, application/xml, text/html, application/json, */*' },
-      });
-
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-      let text = await response.text();
-
-      if ((proxy as any).parseJson && text.startsWith('{')) {
-        try {
-          const json = JSON.parse(text);
-          text = json.contents || json.data || text;
-        } catch {}
-      }
-
-      if (!text || text.length < 50) throw new Error('Empty response');
-
-      const latency = Date.now() - startTime;
-      proxyLatencyMap.set(proxy.name, latency);
-      proxyFailureCount.set(proxy.name, 0);
-      proxySuccessCount.set(proxy.name, (proxySuccessCount.get(proxy.name) ?? 0) + 1);
-      return text;
-
-    } catch (error: any) {
+  const racePromises = sortedProxies.map(proxy =>
+    tryProxy(proxy).catch(error => {
       const errorMsg = error.name === 'AbortError' ? 'Timeout' : error.message;
-      errors.push(`${proxy.name}: ${errorMsg}`);
       proxyFailureCount.set(proxy.name, (proxyFailureCount.get(proxy.name) ?? 0) + 1);
       proxyLatencyMap.set(proxy.name, 999999);
-    }
-  }
+      throw new Error(`${proxy.name}: ${errorMsg}`);
+    })
+  );
 
-  throw new Error(`All proxies failed: ${errors.join(', ')}`);
+  try {
+    return await Promise.any(racePromises);
+  } catch (aggError) {
+    const errors = aggError instanceof AggregateError
+      ? aggError.errors.map((e: Error) => e.message)
+      : ['All proxies failed'];
+    throw new Error(`All proxies failed: ${errors.join(', ')}`);
+  }
 };
 
 export const normalizeSitemapUrl = (input: string): string[] => {
@@ -616,7 +613,7 @@ const extractTitleFromUrl = (url: string): string => {
 
 export const createBlogPostFromUrl = (url: string, index: number): BlogPost => {
   return {
-    id: Date.now() + index + Math.floor(Math.random() * 10000),
+    id: Date.now() + index + crypto.getRandomValues(new Uint32Array(1))[0] % 1000000,
     title: extractTitleFromUrl(url),
     url: url.trim(),
     postType: 'post',
@@ -1938,7 +1935,7 @@ export const analyzeContentAndFindProduct = async (
 
         if (hasAsin && (hasImage || hasValidPrice)) {
           quickProducts.push({
-            id: `prod-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            id: `prod-${crypto.randomUUID()}`,
             title: productData.title || p1.name,
             asin: productData.asin!,
             price: productData.price || 'See Price',
@@ -2038,7 +2035,7 @@ export const analyzeContentAndFindProduct = async (
       const matchedWords = significantWords.filter((word: string) => contentLower.includes(word));
       const matchRatio = significantWords.length > 0 ? matchedWords.length / significantWords.length : 0;
 
-      if (significantWords.length > 0 && matchRatio < 0.2 && matchedWords.length === 0) {
+      if (significantWords.length > 0 && matchRatio < 0.4) {
         continue;
       }
 
@@ -2050,9 +2047,9 @@ export const analyzeContentAndFindProduct = async (
 
     for (const p1 of phase1Products) {
       const key = normalizeProductName(p1.name);
-      if (!validatedProducts.has(key) && p1.confidence >= 40) {
+      if (!validatedProducts.has(key) && p1.confidence >= 80) {
         validatedProducts.set(key, {
-          id: `phase1-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+          id: `phase1-${crypto.randomUUID()}`,
           searchQuery: p1.name,
           title: p1.name,
           asin: p1.asin,
@@ -2130,7 +2127,7 @@ export const analyzeContentAndFindProduct = async (
           : `https://images-na.ssl-images-amazon.com/images/P/${productData.asin}.01._SCLZZZZZZZ_.jpg`;
 
         products.push({
-          id: product.id || `prod-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          id: product.id || `prod-${crypto.randomUUID()}`,
           title: productTitle,
           asin: productData.asin!,
           price: hasValidPrice ? productData.price! : 'See Price',
@@ -2278,26 +2275,71 @@ interface Phase1Product {
   confidence: number;
 }
 
+const NON_PRODUCT_WORDS = new Set([
+  'getting', 'started', 'introduction', 'conclusion', 'summary', 'overview',
+  'benefits', 'advantages', 'disadvantages', 'features', 'comparison',
+  'how', 'why', 'what', 'when', 'where', 'which', 'tips', 'tricks',
+  'guide', 'tutorial', 'step', 'chapter', 'section', 'part', 'update',
+  'important', 'things', 'know', 'about', 'final', 'thoughts', 'verdict',
+  'frequently', 'asked', 'questions', 'related', 'posts', 'articles',
+  'table', 'contents', 'quick', 'answer', 'bottom', 'line', 'wrap',
+]);
+
+const KNOWN_BRANDS_SET = new Set([
+  'apple', 'samsung', 'sony', 'google', 'microsoft', 'amazon', 'nike', 'adidas',
+  'nintendo', 'bose', 'jbl', 'beats', 'sennheiser', 'logitech', 'razer', 'corsair',
+  'asus', 'acer', 'dell', 'hp', 'lenovo', 'dyson', 'shark', 'ninja', 'kitchenaid',
+  'cuisinart', 'breville', 'vitamix', 'fitbit', 'garmin', 'canon', 'nikon', 'gopro',
+  'dji', 'anker', 'jabra', 'philips', 'braun', 'oral-b', 'roomba', 'irobot', 'eufy',
+  'roborock', 'weber', 'dewalt', 'makita', 'milwaukee', 'roku', 'lg', 'tcl', 'hisense',
+  'vizio', 'sonos', 'peloton', 'nordictrack', 'bowflex', 'theragun', 'oura', 'yeti',
+  'hydro flask', 'stanley', 'osprey', 'thule', 'xiaomi', 'huawei', 'amazfit', 'coros',
+  'oneplus', 'whoop', 'hyperice', 'marshall', 'audio-technica', 'shure', 'hyperx',
+  'steelseries', 'elgato', 'keychron', 'nanoleaf', 'govee', 'ring', 'wyze', 'arlo',
+  'nest', 'ecobee', 'tp-link', 'netgear', 'jackery', 'ecoflow', 'bluetti', 'ugreen',
+  'belkin', 'nomad', 'peak design', 'bellroy', 'away', 'samsonite', 'tumi',
+  'benchmade', 'spyderco', 'victorinox', 'nespresso', 'keurig', 'le creuset',
+  'all-clad', 'zwilling', 'traeger', 'lodge', 'secretlab', 'herman miller',
+  'brooks', 'hoka', 'asics', 'new balance', 'saucony', 'on cloud', 'puma', 'reebok',
+  'under armour', 'polar', 'suunto', 'withings', 'oppo', 'realme', 'nothing',
+]);
+
+function isLikelyProductName(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  const words = lower.split(/\s+/);
+  if (words.length > 8 || words.length < 1) return false;
+  if (words.every(w => NON_PRODUCT_WORDS.has(w))) return false;
+  if (/^\d+\s+(ways|tips|reasons|things|steps|benefits|mistakes)/.test(lower)) return false;
+
+  const hasBrand = KNOWN_BRANDS_SET.has(lower) ||
+    [...KNOWN_BRANDS_SET].some(b => lower.startsWith(b + ' '));
+  const hasModelIndicator = /\b(?:Pro|Max|Plus|Ultra|Mini|Lite|Air|SE|Gen\s*\d|Series\s*\d|Mark\s*\d|v\d|Version\s*\d)\b/i.test(text);
+  const hasModelNumber = /\b[A-Z]{1,4}[-]?\d{2,5}[A-Za-z]?\b/.test(text);
+  const hasProductSuffix = /\b(?:Watch|Band|Buds|Tablet|Phone|Laptop|Speaker|Camera|Drone|Tracker|Monitor|Headphones|Earbuds|Keyboard|Mouse|Controller|Console|TV|Display)\b/i.test(text);
+
+  return hasBrand || hasModelIndicator || hasModelNumber || hasProductSuffix;
+}
+
 function extractProductsPhase1(htmlContent: string, textContent: string): Phase1Product[] {
   const products: Phase1Product[] = [];
   const seen = new Set<string>();
 
   const addProduct = (name: string, sourceType: string, confidence: number, asin?: string) => {
-    const cleaned = name.trim().replace(/[\.\,\!\?\;]+$/, '');
-    if (!cleaned || cleaned.length < 4) return;
-    const key = asin || cleaned.toLowerCase().replace(/\s+/g, '_');
+    const cleaned = name.trim().replace(/[\.\,\!\?\;]+$/, '').replace(/^\s*(Best|Top|The|Our|Why|How|New)\s+/i, '').trim();
+    if (!cleaned || cleaned.length < 4 || cleaned.length > 80) return;
+
+    if (!asin && !isLikelyProductName(cleaned)) return;
+
+    const key = asin || cleaned.toLowerCase().replace(/[^a-z0-9]+/g, '_');
     if (seen.has(key)) return;
     seen.add(key);
     products.push({ name: cleaned, asin, sourceType, confidence });
   };
 
-  // Pattern 1: ASIN extraction from Amazon links
   const asinPatterns = [
     /amazon\.[a-z.]+\/(?:dp|gp\/product|gp\/aw\/d|exec\/obidos\/ASIN)\/([A-Z0-9]{10})/gi,
     /\/dp\/([A-Z0-9]{10})/gi,
     /\/(B0[A-Z0-9]{8})(?:[\/\?\s"'&]|$)/gi,
-    /amzn\.to\/([a-zA-Z0-9]+)/gi,
-    /tag=[^&"'\s]+/gi,
   ];
 
   for (const pattern of asinPatterns) {
@@ -2310,30 +2352,86 @@ function extractProductsPhase1(htmlContent: string, textContent: string): Phase1
     }
   }
 
-  // Pattern 1b: Extract product names from Amazon affiliate link anchor text
   const amazonLinkAnchors = /<a[^>]*href="[^"]*(?:amazon\.[a-z.]+|amzn\.to)[^"]*"[^>]*>([^<]{4,80})<\/a>/gi;
   let match;
   while ((match = amazonLinkAnchors.exec(htmlContent)) !== null) {
     const anchorText = match[1]?.trim().replace(/&amp;/g, '&').replace(/&#\d+;/g, '');
-    if (anchorText && anchorText.length >= 4 && !/^(click|buy|check|view|see|get|shop|here|now|more|link|price|deal)/i.test(anchorText)) {
+    if (anchorText && anchorText.length >= 4 && !/^(click|buy|check|view|see|get|shop|here|now|more|link|price|deal|read|learn)/i.test(anchorText)) {
       addProduct(anchorText, 'amazon_anchor', 95);
     }
   }
 
-  // Pattern 2: Numbered list items (relaxed matching)
-  const numberedListPattern = /(?:^|\n)\s*(?:\d+[\.\)]\s*|#\d+[\s:]+)([A-Z][A-Za-z0-9\s\-\.&']{4,70})(?:\s*[-–—:\(]|\n)/gm;
-  while ((match = numberedListPattern.exec(textContent)) !== null) {
-    const productName = match[1]?.trim().replace(/[\.\,\!\?\;]+$/, '');
-    if (!productName || productName.length < 5) continue;
-    const hasNumber = /\d/.test(productName);
-    const hasBrandWord = /\b(?:Pro|Max|Plus|Ultra|Mini|Lite|Air|Band|Watch|Buds|Charge|Series|Gen|Edition|Smart|Wireless|Bluetooth|Premium|Classic|Sport|Active|Studio|Elite|Standard|Essential)\b/i.test(productName);
-    const hasUpperWord = /[A-Z][a-z]+\s+[A-Z]/.test(productName);
-    if (hasNumber || hasBrandWord || hasUpperWord) {
-      addProduct(productName, 'numbered_list', 95);
+  const standaloneProducts = [
+    /\b(AirPods(?:\s*(?:Pro|Max))?(?:\s*\d+)?)\b/gi,
+    /\b(Galaxy\s*(?:Buds|Watch|Tab|S\d+|Z\s*(?:Fold|Flip)|Fit|Ring)(?:\s*\d+)?(?:\s*(?:Pro|Plus|Ultra|FE))?)\b/gi,
+    /\b(Pixel\s*(?:\d+|Buds|Watch|Tablet)(?:\s*(?:Pro|a))?)\b/gi,
+    /\b(iPhone\s*(?:\d+)?(?:\s*(?:Pro|Max|Plus|SE))?)\b/gi,
+    /\b(iPad\s*(?:Pro|Air|Mini)?(?:\s*\d+)?)\b/gi,
+    /\b(MacBook\s*(?:Air|Pro)?(?:\s*\d+)?)\b/gi,
+    /\b(Apple\s*Watch(?:\s*(?:Series|SE|Ultra)\s*\d*)?)\b/gi,
+    /\b(Echo\s*(?:Dot|Show|Studio|Pop)(?:\s*(?:\d+|Gen\s*\d+))?)\b/gi,
+    /\b(Kindle\s*(?:Paperwhite|Oasis|Scribe|Colorsoft))\b/gi,
+    /\b(Fire\s*(?:TV\s*Stick|HD\s*\d+)(?:\s*(?:Lite|Max|Kids|Plus))?)\b/gi,
+    /\b(PlayStation\s*\d+(?:\s*(?:Pro|Slim|VR\d*))?)\b/gi,
+    /\b(Xbox\s*(?:Series\s*[XS]|One(?:\s*[XS])?))\b/gi,
+    /\b(Nintendo\s*Switch(?:\s*(?:OLED|Lite|2))?)\b/gi,
+    /\b(Meta\s*Quest\s*\d+(?:\s*S)?)\b/gi,
+    /\b(Instant\s*Pot(?:\s*(?:Duo|Pro|Ultra|Vortex))?)\b/gi,
+    /\b(Roomba\s*(?:[a-z]?\d+|Combo|j\d+|s\d+))\b/gi,
+    /\b(Fitbit\s*(?:Charge|Versa|Sense|Luxe|Inspire|Ace)\s*\d*)\b/gi,
+    /\b(Garmin\s*(?:Forerunner|Fenix|Venu|Instinct|Enduro|Lily|Vivomove|Vivoactive)\s*\d*(?:\s*[A-Za-z]+)?)\b/gi,
+    /\b(Amazfit\s*(?:Band|GTR|GTS|Bip|T-Rex|Cheetah|Falcon|Balance)\s*\d*(?:\s*(?:Pro|Plus|Ultra))?)\b/gi,
+    /\b(Surface\s*(?:Pro|Laptop|Go|Studio|Book)\s*\d*)\b/gi,
+    /\b(ThinkPad\s*[A-Z]\d+(?:\s*(?:Gen\s*\d+|s|i))?)\b/gi,
+    /\b(Steam\s*Deck(?:\s*(?:OLED|LCD))?)\b/gi,
+    /\b(Ring\s*(?:Doorbell|Camera|Alarm|Floodlight)(?:\s*(?:Pro|Plus|Elite|\d+))?)\b/gi,
+    /\b(Nest\s*(?:Thermostat|Cam|Doorbell|Hub|Mini|Audio)(?:\s*(?:Pro|Max|\d+))?)\b/gi,
+    /\b(Dyson\s*(?:V\d+|Airwrap|Supersonic|Pure|Big\s*Quiet|Zone)(?:\s*(?:Absolute|Animal|Motorhead|Detect))?)\b/gi,
+    /\b(Sonos\s*(?:One|Beam|Arc|Sub|Move|Roam|Era|Port|Amp|Ray)\s*\d*)\b/gi,
+    /\b(Oura\s*Ring\s*(?:Gen\s*\d+|\d+)?)\b/gi,
+    /\b(YETI\s*(?:Rambler|Tundra|Roadie|Hopper|Panga)(?:\s*\d+)?)\b/gi,
+    /\b(Mi\s*(?:Band|Watch|Smart\s*Band)\s*\d+(?:\s*(?:Pro|NFC))?)\b/gi,
+    /\b(Sony\s*WH[-\s]?\d{4}[A-Z]*\d*)\b/gi,
+    /\b(Sony\s*WF[-\s]?\d{4}[A-Z]*\d*)\b/gi,
+    /\b(Bose\s*(?:QuietComfort|QC)\s*\d*(?:\s*(?:Ultra|SE))?)\b/gi,
+    /\b(DJI\s*(?:Mini|Air|Mavic|Avata|FPV|Action|Osmo)\s*\d*(?:\s*(?:Pro|S|SE))?)\b/gi,
+    /\b(GoPro\s*(?:Hero|Max|Session)\s*\d*(?:\s*Black)?)\b/gi,
+    /\b(Ninja\s*(?:Foodi|Creami|Woodfire|Blender|Air\s*Fryer)[A-Za-z0-9\s]*?)\b/gi,
+  ];
+
+  for (const pattern of standaloneProducts) {
+    let match;
+    while ((match = pattern.exec(textContent)) !== null) {
+      const fullMatch = match[1]?.trim();
+      if (!fullMatch || fullMatch.length < 4) continue;
+      addProduct(fullMatch, 'standalone', 95);
     }
   }
 
-  // Pattern 3: HTML headers - strip nested tags before matching
+  const BRAND_PATTERN = /\b(Apple|Samsung|Sony|Google|Microsoft|Nike|Adidas|Nintendo|Bose|JBL|Beats|Sennheiser|Logitech|Razer|Corsair|ASUS|Acer|Dell|HP|Lenovo|Dyson|Shark|Ninja|KitchenAid|Cuisinart|Breville|Vitamix|Fitbit|Garmin|Canon|Nikon|GoPro|DJI|Anker|Jabra|Philips|Braun|Oral-B|iRobot|Eufy|Roborock|DeWalt|Makita|Milwaukee|Roku|LG|TCL|Hisense|Sonos|Peloton|NordicTrack|Bowflex|Theragun|Oura|YETI|Hydro\s*Flask|Stanley|Osprey|Thule|Xiaomi|Huawei|Amazfit|COROS|OnePlus|Whoop|Hyperice|Marshall|Audio-Technica|Shure|HyperX|SteelSeries|Elgato|Keychron|Nanoleaf|Govee|Ring|Wyze|Arlo|Nest|Ecobee|TP-Link|Netgear|Jackery|EcoFlow|Bluetti|Ugreen|Belkin|Nespresso|Keurig|Le\s*Creuset|Secretlab|Herman\s*Miller|Brooks|Hoka|Asics|New\s*Balance|Saucony|Polar|Suunto|Withings)\s+([A-Z][A-Za-z0-9][\w\s\-\.&']{0,40}?)(?=[\.\,\!\?\;\:\)\]"'<]|\s+(?:is|are|was|were|has|have|had|with|for|and|or|but|features|offers|comes|includes|provides|delivers|review|vs|versus|compared)|\s*$)/gi;
+
+  let brandMatch;
+  while ((brandMatch = BRAND_PATTERN.exec(textContent)) !== null) {
+    const brand = brandMatch[1];
+    const model = brandMatch[2]?.trim().replace(/[\.\,\!\?\;]+$/, '');
+    if (!model || model.length < 1) continue;
+    const full = `${brand} ${model}`.trim();
+    if (full.length < 5 || full.length > 60) continue;
+
+    const modelWords = model.split(/\s+/);
+    if (modelWords.every(w => NON_PRODUCT_WORDS.has(w.toLowerCase()))) continue;
+
+    addProduct(full, 'brand_model', 88);
+  }
+
+  const modelNumberPattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+((?:[A-Z]{1,4}[-]?\d{2,5}[A-Za-z]?)(?:\s*(?:Pro|Max|Plus|Ultra|Mini|SE|Gen\s*\d+))?)\b/g;
+  while ((match = modelNumberPattern.exec(textContent)) !== null) {
+    const fullMatch = match[0].trim();
+    if (fullMatch.length >= 5 && fullMatch.length <= 60) {
+      addProduct(fullMatch, 'model_number', 82);
+    }
+  }
+
   const headerPattern = /<h[2-4][^>]*>([\s\S]*?)<\/h[2-4]>/gi;
   while ((match = headerPattern.exec(htmlContent)) !== null) {
     const rawHeader = match[1] || '';
@@ -2345,105 +2443,21 @@ function extractProductsPhase1(htmlContent: string, textContent: string): Phase1
       .replace(/\s+/g, ' ')
       .trim()
       .replace(/^(?:\d+[\.\)]\s*|#\d+\s+)/, '');
-    if (!headerText || headerText.length < 5 || headerText.length > 100) continue;
-
-    const looksLikeProduct =
-      /\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Band|Watch|Tracker|Pro|Max|Plus|Ultra|Mini|Lite|\d+)|\d{3,4}[A-Za-z]*)\b/.test(headerText) ||
-      /[A-Z][a-z]+\s+[A-Z][A-Za-z0-9]/.test(headerText) ||
-      /\b(?:Best|Top|Review|vs\.?)\b/i.test(headerText) && /[A-Z][a-z]{2,}/.test(headerText);
-
-    if (looksLikeProduct) {
-      const cleanName = headerText
-        .replace(/\s*[-–—]\s*(Best|Top|Review|Our|The|A|An|Detailed|Full|Complete|In-Depth|Honest).*$/i, '')
-        .replace(/^\s*(Best|Top|The|Our|Why|How)\s+/i, '')
-        .trim();
-      if (cleanName.length >= 5) {
-        addProduct(cleanName, 'header', 90);
-      }
-    }
+    if (!headerText || headerText.length < 5 || headerText.length > 80) continue;
+    addProduct(headerText, 'header', 75);
   }
 
-  // Pattern 4: Products in bold/strong tags (common in listicles)
-  const boldPattern = /<(?:strong|b)[^>]*>([^<]{5,80})<\/(?:strong|b)>/gi;
+  const boldPattern = /<(?:strong|b)[^>]*>([^<]{5,60})<\/(?:strong|b)>/gi;
   while ((match = boldPattern.exec(htmlContent)) !== null) {
     const boldText = match[1]?.trim().replace(/&amp;/g, '&').replace(/&#\d+;/g, '');
     if (!boldText || boldText.length < 5) continue;
-    const looksLikeProduct = /[A-Z][a-z]+\s+[A-Z0-9]/.test(boldText) || /\d/.test(boldText);
-    const notSentence = boldText.split(/\s+/).length <= 8 && !/\b(the|this|that|these|those|what|why|how|when|where|which|our|my|your|their|its|we|you|they|he|she|it|and|but|or|so|if|in|on|at|to|for|of|with|by|from)\b/i.test(boldText.split(/\s+/)[0] || '');
-    if (looksLikeProduct && notSentence) {
-      addProduct(boldText, 'bold_mention', 80);
-    }
+    const words = boldText.split(/\s+/);
+    if (words.length > 6) continue;
+    if (/\b(the|this|that|what|why|how|our|my|your|we|you|they)\b/i.test(words[0] || '')) continue;
+    addProduct(boldText, 'bold_mention', 72);
   }
 
-  // Pattern 5: Comprehensive brand patterns
-  const brandPatterns = [
-    /\b(Xiaomi|Huawei|Amazfit|COROS|OnePlus|Oppo|Vivo|Realme|Nothing|Oura|Whoop|Theragun|Hyperice|Sonos|Bang\s*&?\s*Olufsen|Marshall|Technics|Audio-Technica|Shure|HyperX|SteelSeries|Elgato|Blue\s*Yeti|Rode|Keychron|Ducky|GMMK|Nanoleaf|Govee|Hue|Ring|Wyze|Arlo|Nest|SimpliSafe|August|Yale|Ecobee|Lutron|Sonos|Blink|TP-Link|Netgear|Ubiquiti|Synology|Anova|Thermapen|Traeger|Blackstone|Lodge|Le\s*Creuset|Staub|All-Clad|Zwilling|Wusthof|Vitamix|Blendtec|NutriBullet|Nespresso|Keurig|Breville|Fellow|Baratza|Rancilio|Gaggia|Osprey|Gregory|Deuter|Arc'teryx|Black\s*Diamond|MSR|Jetboil|BioLite|Goal\s*Zero|Jackery|EcoFlow|Bluetti|Anker|Ugreen|Belkin|Satechi|CalDigit|OWC|Twelve\s*South|Nomad|Peak\s*Design|Moment|Bellroy|Aer|Tortuga|Away|Samsonite|Rimowa|Tumi|Benchmade|Kershaw|Spyderco|Gerber|Victorinox|Cricut|Silhouette|Brother)\s+([A-Za-z0-9][\w\s\-\.&']{1,50}?)(?=[\.\,\!\?\;\:\)\]\"\'\<]|\s+(?:is|are|was|were|has|have|had|with|for|and|or|but|features|offers|comes|includes|provides|delivers|boasts|review|vs|versus|compared)|\s*$)/gi,
-    /\b(Apple|Samsung|Sony|Google|Microsoft|Amazon|Nike|Adidas|Nintendo|Bose|JBL|Beats|Sennheiser|Logitech|Razer|Corsair|ASUS|Acer|Dell|HP|Lenovo|Dyson|Shark|Ninja|KitchenAid|Cuisinart|Breville|Vitamix|Instant\s*Pot|Fitbit|Garmin|Canon|Nikon|GoPro|DJI|Anker|Jabra|Philips|Braun|Oral-B|Roomba|iRobot|Eufy|Roborock|Weber|DeWalt|Makita|Milwaukee|Roku|Kindle|Echo|AirPods|PlayStation|Xbox|LG|TCL|Hisense|Vizio|Sonos|Bose|Herman\s*Miller|Secretlab|Steelcase|Peloton|NordicTrack|Bowflex|Theragun|Oura|YETI|Hydro\s*Flask|Stanley|Osprey|Thule|REI)\s+([A-Za-z0-9][\w\s\-\.&']{1,50}?)(?=[\.\,\!\?\;\:\)\]\"\'\<]|\s+(?:is|are|was|were|has|have|had|with|for|and|or|but|features|offers|comes|includes|provides|delivers|boasts|review|vs|versus|compared)|\s*$)/gi,
-  ];
-
-  for (const pattern of brandPatterns) {
-    let match;
-    while ((match = pattern.exec(textContent)) !== null) {
-      const fullMatch = match[0].trim().replace(/[\.\,\!\?\;]+$/, '');
-      if (fullMatch.length < 5 || fullMatch.length > 70) continue;
-      addProduct(fullMatch, 'brand_model', 85);
-    }
-  }
-
-  // Pattern 6: Standalone products
-  const standaloneProducts = [
-    /\b(AirPods(?:\s*(?:Pro|Max))?(?:\s*\d+)?)\b/gi,
-    /\b(Galaxy\s*(?:Buds|Watch|Tab|S\d+|Z\s*(?:Fold|Flip)|Fit|Ring)(?:\s*\d+)?(?:\s*(?:Pro|Plus|Ultra|FE))?)\b/gi,
-    /\b(Pixel\s*(?:\d+|Buds|Watch|Tablet)(?:\s*(?:Pro|a))?)\b/gi,
-    /\b(iPhone\s*(?:\d+)?(?:\s*(?:Pro|Max|Plus|SE))?)\b/gi,
-    /\b(iPad\s*(?:Pro|Air|Mini)?(?:\s*\d+)?)\b/gi,
-    /\b(MacBook\s*(?:Air|Pro)?(?:\s*\d+)?)\b/gi,
-    /\b(Apple\s*Watch(?:\s*(?:Series|SE|Ultra)\s*\d*)?)\b/gi,
-    /\b(Echo\s*(?:Dot|Show|Studio|Pop)?(?:\s*(?:\d+|Gen\s*\d+))?)\b/gi,
-    /\b(Kindle\s*(?:Paperwhite|Oasis|Scribe|Colorsoft)?)\b/gi,
-    /\b(Fire\s*(?:TV|Stick|Tablet|HD)(?:\s*\d+)?(?:\s*(?:Lite|Max|Kids|Plus))?)\b/gi,
-    /\b(PlayStation\s*\d+(?:\s*(?:Pro|Slim|VR\d*))?)\b/gi,
-    /\b(Xbox\s*(?:Series\s*[XS]|One(?:\s*[XS])?))\b/gi,
-    /\b(Nintendo\s*Switch(?:\s*(?:OLED|Lite|2))?)\b/gi,
-    /\b(Meta\s*Quest\s*\d+(?:\s*S)?)\b/gi,
-    /\b(Quest\s*\d+(?:\s*S)?)\b/gi,
-    /\b(Instant\s*Pot(?:\s*(?:Duo|Pro|Ultra|Vortex))?)\b/gi,
-    /\b(Roomba\s*(?:[a-z]?\d+|Combo|j\d+|s\d+))\b/gi,
-    /\b(Fitbit\s*(?:Charge|Versa|Sense|Luxe|Inspire|Ace)\s*\d*)\b/gi,
-    /\b(Garmin\s*(?:Forerunner|Fenix|Venu|Instinct|Enduro|Lily|Vivomove|Vivoactive)\s*\d*(?:\s*[A-Za-z]+)?)\b/gi,
-    /\b(Mi\s*(?:Band|Watch|Smart\s*Band)\s*\d+(?:\s*(?:Pro|NFC))?)\b/gi,
-    /\b(Amazfit\s*(?:Band|GTR|GTS|Bip|T-Rex|Cheetah|Falcon|Balance)\s*\d*(?:\s*(?:Pro|Plus|Ultra))?)\b/gi,
-    /\b(Surface\s*(?:Pro|Laptop|Go|Studio|Book)\s*\d*)\b/gi,
-    /\b(ThinkPad\s*[A-Z]\d+(?:\s*(?:Gen\s*\d+|s|i))?)\b/gi,
-    /\b(Steam\s*Deck(?:\s*(?:OLED|LCD))?)\b/gi,
-    /\b(Ring\s*(?:Doorbell|Camera|Alarm|Floodlight)(?:\s*(?:Pro|Plus|Elite|\d+))?)\b/gi,
-    /\b(Nest\s*(?:Thermostat|Cam|Doorbell|Hub|Mini|Audio)(?:\s*(?:Pro|Max|\d+))?)\b/gi,
-    /\b(Dyson\s*(?:V\d+|Airwrap|Supersonic|Pure|Big\s*Quiet|Zone)(?:\s*(?:Absolute|Animal|Motorhead|Detect))?)\b/gi,
-    /\b(Sonos\s*(?:One|Beam|Arc|Sub|Move|Roam|Era|Port|Amp|Ray)\s*\d*)\b/gi,
-    /\b(Oura\s*Ring\s*(?:Gen\s*\d+|\d+)?)\b/gi,
-    /\b(YETI\s*(?:Rambler|Tundra|Roadie|Hopper|Panga)(?:\s*\d+)?)\b/gi,
-  ];
-
-  for (const pattern of standaloneProducts) {
-    let match;
-    while ((match = pattern.exec(textContent)) !== null) {
-      const fullMatch = match[1]?.trim();
-      if (!fullMatch || fullMatch.length < 4) continue;
-      addProduct(fullMatch, 'standalone', 92);
-    }
-  }
-
-  // Pattern 7: Generic product patterns with model numbers
-  const modelNumberPattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+((?:[A-Z]{1,3}[-]?\d{2,5}[A-Za-z]*|\d{3,5}[A-Za-z]+)(?:\s*(?:Pro|Max|Plus|Ultra|Mini|SE|Gen\s*\d+))?)\b/g;
-  while ((match = modelNumberPattern.exec(textContent)) !== null) {
-    const fullMatch = match[0].trim();
-    if (fullMatch.length >= 5 && fullMatch.length <= 60) {
-      addProduct(fullMatch, 'model_number', 82);
-    }
-  }
-
-  // Pattern 8: Products in affiliate-style link text (non-Amazon)
-  const affiliateLinkPattern = /<a[^>]*href="[^"]*(?:shareasale|commission|awin|partnerize|impact|affiliate|ref=|tag=)[^"]*"[^>]*>([^<]{5,80})<\/a>/gi;
+  const affiliateLinkPattern = /<a[^>]*href="[^"]*(?:shareasale|commission|awin|partnerize|impact|affiliate)[^"]*"[^>]*>([^<]{5,80})<\/a>/gi;
   while ((match = affiliateLinkPattern.exec(htmlContent)) !== null) {
     const linkText = match[1]?.trim().replace(/&amp;/g, '&');
     if (linkText && linkText.length >= 5 && /[A-Z]/.test(linkText)) {
@@ -2507,7 +2521,7 @@ const generateDefaultFaqs = (productTitle: string): FAQItem[] => {
 // ============================================================================
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || '';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 
 /**
  * Get raw API key - just return it as-is
@@ -2529,8 +2543,8 @@ class SerpApiError extends Error {
   }
 }
 
-const HARDCODED_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://ousxeycrhvuwaejhpqgv.supabase.co';
-const HARDCODED_SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im91c3hleWNyaHZ1d2FlamhwcWd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwNDg3NDgsImV4cCI6MjA4NTYyNDc0OH0.T3abJctCxKFrtkbusDGMursbZXP768sWxz3_yIi9lIc';
+const EDGE_FUNCTION_URL = SUPABASE_URL;
+const EDGE_FUNCTION_KEY = SUPABASE_ANON_KEY;
 
 const callSerpApiProxy = async (params: {
   type: 'search' | 'product';
@@ -2543,7 +2557,7 @@ const callSerpApiProxy = async (params: {
   }
 
   // ALWAYS use the Supabase Edge Function proxy — never call SerpAPI directly
-  const edgeFunctionUrl = `${HARDCODED_SUPABASE_URL}/functions/v1/serpapi-proxy`;
+  const edgeFunctionUrl = `${EDGE_FUNCTION_URL}/functions/v1/serpapi-proxy`;
   
   let response: Response;
   let lastError: Error | null = null;
@@ -2555,7 +2569,7 @@ const callSerpApiProxy = async (params: {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${HARDCODED_SUPABASE_KEY}`,
+          'Authorization': `Bearer ${EDGE_FUNCTION_KEY}`,
         },
         body: JSON.stringify(params),
       });
@@ -2597,15 +2611,23 @@ const callSerpApiProxy = async (params: {
 
 const extractPrice = (result: any): string => {
   const priceFields = [
-    result.price?.raw,
-    result.price?.current,
-    result.price?.value,
-    result.price_string,
-    result.extracted_price ? `$${result.extracted_price}` : null,
     result.buybox_winner?.price?.raw,
     result.buybox_winner?.price?.value ? `$${result.buybox_winner.price.value}` : null,
+    result.buybox_winner?.price?.display,
+    result.price?.raw,
+    result.price?.current,
+    result.price?.display,
+    result.price?.value ? `$${result.price.value}` : null,
+    result.price_string,
+    result.extracted_price ? `$${result.extracted_price}` : null,
     result.typical_price?.raw,
-    typeof result.price === 'string' ? result.price : null,
+    result.typical_price?.display,
+    result.list_price?.raw,
+    result.current_price?.raw,
+    result.pricing?.[0]?.price?.raw,
+    result.pricing?.[0]?.price?.display,
+    result.offer_price,
+    typeof result.price === 'string' && result.price.includes('$') ? result.price : null,
     typeof result.price === 'number' ? `$${result.price.toFixed(2)}` : null,
   ];
 
@@ -2620,19 +2642,30 @@ const extractPrice = (result: any): string => {
 
 const extractImage = (result: any): string => {
   const imageFields = [
-    result.main_image,
+    result.main_image?.link,
+    typeof result.main_image === 'string' ? result.main_image : null,
+    result.images?.[0]?.link,
+    result.images?.[0]?.url,
+    result.images?.[0]?.large,
+    result.images?.[0]?.hiRes,
+    typeof result.images?.[0] === 'string' ? result.images[0] : null,
     result.thumbnail,
     result.image,
     result.primary_image,
-    result.images?.[0]?.link,
-    result.images?.[0]?.url,
-    typeof result.images?.[0] === 'string' ? result.images[0] : null,
+    result.image_url,
+    result.main_image_url,
+    result.buybox_winner?.main_image?.link,
+    typeof result.buybox_winner?.main_image === 'string' ? result.buybox_winner.main_image : null,
+    result.media?.images?.[0]?.link,
+    typeof result.media?.images?.[0] === 'string' ? result.media.images[0] : null,
+    result.product_photo,
+    result.full_image,
     result.media?.[0]?.link,
     result.gallery?.[0],
   ];
 
   for (const field of imageFields) {
-    if (field && typeof field === 'string' && (field.includes('amazon') || field.includes('http'))) {
+    if (field && typeof field === 'string' && field.startsWith('http')) {
       return upgradeAmazonImageToHighRes(field);
     }
   }
@@ -2719,67 +2752,11 @@ export const searchAmazonProduct = async (
 };
 
 const extractProductPrice = (result: any): string => {
-  const priceFields = [
-    result.buybox_winner?.price?.raw,
-    result.buybox_winner?.price?.value ? `$${result.buybox_winner.price.value}` : null,
-    result.buybox_winner?.price?.display,
-    result.price?.raw,
-    result.price?.current,
-    result.price?.display,
-    result.price?.value ? `$${result.price.value}` : null,
-    typeof result.price === 'string' && result.price.includes('$') ? result.price : null,
-    typeof result.price === 'number' ? `$${result.price}` : null,
-    result.pricing?.[0]?.price?.raw,
-    result.pricing?.[0]?.price?.display,
-    result.price_string,
-    result.typical_price?.raw,
-    result.typical_price?.display,
-    result.list_price?.raw,
-    result.current_price?.raw,
-    result.offer_price,
-  ];
-
-  for (let i = 0; i < priceFields.length; i++) {
-    const field = priceFields[i];
-    if (field && typeof field === 'string' && field.includes('$')) {
-      return field;
-    }
-  }
-
-  return '$XX.XX';
+  return extractPrice(result);
 };
 
 const extractProductImage = (result: any): string => {
-  const imageFields = [
-    result.main_image?.link,
-    typeof result.main_image === 'string' ? result.main_image : null,
-    result.images?.[0]?.link,
-    result.images?.[0]?.url,
-    result.images?.[0]?.large,
-    result.images?.[0]?.medium,
-    result.images?.[0]?.hiRes,
-    result.images?.[0]?.large_image,
-    typeof result.images?.[0] === 'string' ? result.images[0] : null,
-    result.thumbnail,
-    result.image,
-    result.image_url,
-    result.main_image_url,
-    result.buybox_winner?.main_image?.link,
-    typeof result.buybox_winner?.main_image === 'string' ? result.buybox_winner.main_image : null,
-    result.media?.images?.[0]?.link,
-    typeof result.media?.images?.[0] === 'string' ? result.media.images[0] : null,
-    result.product_photo,
-    result.full_image,
-  ];
-
-  for (let i = 0; i < imageFields.length; i++) {
-    const field = imageFields[i];
-    if (field && typeof field === 'string' && field.startsWith('http')) {
-      return upgradeAmazonImageToHighRes(field);
-    }
-  }
-
-  return '';
+  return extractImage(result);
 };
 
 /**
@@ -2838,7 +2815,7 @@ export const fetchProductByASIN = async (
     };
 
     const product: ProductDetails = {
-      id: `prod-${asin}-${Date.now()}`,
+      id: `prod-${asin}-${crypto.randomUUID().slice(0, 8)}`,
       asin,
       title: partialProduct.title,
       price,
@@ -3557,19 +3534,19 @@ export const generateProductSchema = (
       '@type': 'Brand',
       name: product.brand,
     } : undefined,
-    aggregateRating: {
+    aggregateRating: (product.rating && product.reviewCount) ? {
       '@type': 'AggregateRating',
-      ratingValue: product.rating || 4.5,
-      reviewCount: product.reviewCount || 100,
+      ratingValue: product.rating,
+      reviewCount: product.reviewCount,
       bestRating: 5,
       worstRating: 1,
-    },
+    } : undefined,
     offers: {
       '@type': 'Offer',
       url: amazonUrl,
       priceCurrency: 'USD',
       price: product.price?.replace(/[^0-9.]/g, '') || '0',
-      availability: 'https://schema.org/InStock',
+      availability: 'https://schema.org/OnlineOnly',
       seller: {
         '@type': 'Organization',
         name: 'Amazon',
@@ -3816,38 +3793,3 @@ export const fetchPostsFromWordPressAPI = async (
 
 
 
-// ============================================================================
-// DEFAULT EXPORT (Optional - for backward compatibility)
-// ============================================================================
-
-export default {
-  SecureStorage,
-  IntelligenceCache,
-  fetchWithSmartProxy,
-  getProxyStats,
-  resetProxyStats,
-  fetchAndParseSitemap,
-  normalizeSitemapUrl,
-  parseSitemapXml,
-  fetchPageContent,
-  fetchRawPostContent,
-  splitContentIntoBlocks,
-  preExtractAmazonProducts,
-  pushToWordPress,
-  testConnection,
-  callAIProvider,
-  analyzeContentAndFindProduct,
-  searchAmazonProduct,
-  fetchProductByASIN,
-  extractASIN,
-  generateProductBoxHtml,
-  generateComparisonTableHtml,
-  generateProductSchema,
-  generateFaqSchema,
-  calculatePostPriority,
-  runConcurrent,
-  debounce,
-  throttle,
-  validateManualUrl,
-  createBlogPostFromUrl,
-};

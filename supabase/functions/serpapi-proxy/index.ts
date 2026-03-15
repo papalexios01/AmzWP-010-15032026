@@ -1,9 +1,9 @@
-// @ts-nocheck — suppress Deno type resolution for edge-runtime
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
 interface SearchRequest {
@@ -86,10 +86,11 @@ Deno.serve(async (req: Request) => {
       }
     );
 
-  } catch (error: any) {
-    const isTimeout = error.name === 'AbortError';
+  } catch (error) {
+    const isTimeout = error instanceof Error && error.name === 'AbortError';
+    const message = error instanceof Error ? error.message : "Internal server error";
     return new Response(
-      JSON.stringify({ error: isTimeout ? "Request timed out - try again" : (error.message || "Internal server error") }),
+      JSON.stringify({ error: isTimeout ? "Request timed out - try again" : message }),
       {
         status: isTimeout ? 504 : 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
