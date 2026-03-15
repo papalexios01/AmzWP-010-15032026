@@ -160,8 +160,9 @@ export const SitemapScanner: React.FC<SitemapScannerProps> = ({
 
   // ========== WORDPRESS API DISCOVERY ==========
   const handleWordPressAPI = async () => {
-    if (!config.wpUrl || !config.wpUser || !config.wpAppPassword) {
-      showToast('Configure WordPress credentials first', 'warning');
+    const targetUrl = sitemapUrl.trim() || config.wpUrl;
+    if (!targetUrl) {
+      showToast('Enter a domain name first', 'warning');
       return;
     }
 
@@ -171,19 +172,23 @@ export const SitemapScanner: React.FC<SitemapScannerProps> = ({
     setAuditProgress({ current: 0, total: 0 });
 
     try {
-      const discoveredPosts = await fetchPostsFromWordPressAPI(config, (current, total) => {
-        setAuditProgress({ current, total });
-      });
+      const discoveredPosts = await fetchPostsFromWordPressAPI(
+        config,
+        (current, total) => {
+          setAuditProgress({ current, total });
+        },
+        targetUrl
+      );
 
       setPosts(discoveredPosts);
-      setSitemapUrl(config.wpUrl);
+      if (!sitemapUrl.trim()) setSitemapUrl(targetUrl);
       setStatus('complete');
       showToast(`Found ${discoveredPosts.length} posts via WordPress API!`, 'success');
 
     } catch (error: any) {
       setErrorMessage(`WordPress API Error: ${error.message}`);
       setStatus('error');
-      showToast('WordPress API failed - check credentials', 'error');
+      showToast('WordPress API failed - try Sitemap Discover instead', 'error');
     }
   };
 
@@ -326,9 +331,9 @@ export const SitemapScanner: React.FC<SitemapScannerProps> = ({
             {/* WordPress API Button */}
             <button
               onClick={handleWordPressAPI}
-              disabled={status === 'scanning' || status === 'auditing'}
+              disabled={status === 'scanning' || status === 'auditing' || (!sitemapUrl.trim() && !config.wpUrl)}
               className="px-6 py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-2xl transition-all disabled:opacity-50 flex items-center gap-2"
-              title="Fetch ALL posts from WordPress REST API"
+              title="Fetch ALL posts from WordPress REST API (works with any WordPress site)"
             >
               {status === 'scanning' && discoveryMethod === 'wordpress' ? (
                 <>

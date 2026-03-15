@@ -3708,10 +3708,17 @@ export const validateManualUrl = (url: string): { isValid: boolean; normalizedUr
  */
 export const fetchPostsFromWordPressAPI = async (
   config: AppConfig,
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  overrideUrl?: string
 ): Promise<BlogPost[]> => {
-  if (!config.wpUrl) {
-    throw new Error('WordPress URL not configured');
+  const siteUrl = overrideUrl || config.wpUrl;
+  if (!siteUrl) {
+    throw new Error('No WordPress URL provided. Enter a domain above or configure it in Settings.');
+  }
+
+  let normalizedUrl = siteUrl.trim().replace(/\/+$/, '');
+  if (!normalizedUrl.startsWith('http://') && !normalizedUrl.startsWith('https://')) {
+    normalizedUrl = 'https://' + normalizedUrl;
   }
 
   const allPosts: BlogPost[] = [];
@@ -3720,35 +3727,68 @@ export const fetchPostsFromWordPressAPI = async (
   let totalPages = 1;
   let totalPosts = 0;
 
-  const apiBase = config.wpUrl.replace(/\/$/, '') + '/wp-json/wp/v2';
+  const apiBase = normalizedUrl.replace(/\/$/, '') + '/wp-json/wp/v2';
 
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+  };
   if (config.wpUser && config.wpAppPassword) {
     const auth = btoa(`${config.wpUser}:${config.wpAppPassword}`);
     headers['Authorization'] = `Basic ${auth}`;
   }
 
+  const fetchPage = async (pageUrl: string): Promise<Response> => {
+    try {
+      const directResponse = await fetchWithTimeout(pageUrl, 15000, {
+        headers,
+        mode: 'cors',
+      });
+      if (directResponse.ok) return directResponse;
+      throw new Error(`HTTP ${directResponse.status}`);
+    } catch {
+      const proxyText = await fetchWithSmartProxy(pageUrl, { timeout: 20000 });
+      const parsed = JSON.parse(proxyText);
+      return new Response(JSON.stringify(parsed), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  };
+
   try {
     while (currentPage <= totalPages) {
       const url = `${apiBase}/posts?page=${currentPage}&per_page=${perPage}&_embed=false`;
 
-      const response = await fetchWithTimeout(url, 30000, { headers });
+      let posts: any[];
 
-      if (!response.ok) {
-        if (response.status === 400 && currentPage > 1) {
-          break;
+      try {
+        const response = await fetchPage(url);
+        if (!response.ok) {
+          if (response.status === 400 && currentPage > 1) break;
+          throw new Error(`WordPress API error: ${response.status}`);
         }
-        throw new Error(`WordPress API error: ${response.status}`);
-      }
 
-      if (currentPage === 1) {
-        const totalPagesHeader = response.headers.get('X-WP-TotalPages');
-        const totalPostsHeader = response.headers.get('X-WP-Total');
-        totalPages = totalPagesHeader ? parseInt(totalPagesHeader, 10) : 1;
-        totalPosts = totalPostsHeader ? parseInt(totalPostsHeader, 10) : 0;
-      }
+        if (currentPage === 1) {
+          const totalPagesHeader = response.headers.get('X-WP-TotalPages');
+          const totalPostsHeader = response.headers.get('X-WP-Total');
+          if (totalPagesHeader) totalPages = parseInt(totalPagesHeader, 10);
+          if (totalPostsHeader) totalPosts = parseInt(totalPostsHeader, 10);
+        }
 
-      const posts = await response.json();
+        posts = await response.json();
+      } catch {
+        const proxyText = await fetchWithSmartProxy(url, { timeout: 20000 });
+        try {
+          posts = JSON.parse(proxyText);
+        } catch {
+          throw new Error('Failed to parse WordPress API response');
+        }
+
+        if (currentPage === 1 && Array.isArray(posts)) {
+          totalPages = Math.max(1, Math.ceil(posts.length / perPage));
+          totalPosts = posts.length;
+        }
+      }
 
       if (!Array.isArray(posts) || posts.length === 0) {
         break;
@@ -3771,7 +3811,7 @@ export const fetchPostsFromWordPressAPI = async (
       }
 
       if (onProgress) {
-        onProgress(allPosts.length, totalPosts);
+        onProgress(allPosts.length, totalPosts || allPosts.length);
       }
 
       currentPage++;
@@ -3779,6 +3819,10 @@ export const fetchPostsFromWordPressAPI = async (
       if (currentPage <= totalPages) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
+    }
+
+    if (allPosts.length === 0) {
+      throw new Error('No posts found. Make sure this is a WordPress site with published posts.');
     }
 
     return allPosts;
