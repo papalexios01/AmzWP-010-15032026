@@ -1934,6 +1934,11 @@ export const analyzeContentAndFindProduct = async (
         const hasValidPrice = productData.price && productData.price !== '$XX.XX';
 
         if (hasAsin && (hasImage || hasValidPrice)) {
+          const relevance = computeQueryRelevance(p1.name, productData.title || '');
+          if (relevance < 0.3 && !p1.asin) {
+            continue;
+          }
+
           quickProducts.push({
             id: `prod-${crypto.randomUUID()}`,
             title: productData.title || p1.name,
@@ -2120,6 +2125,12 @@ export const analyzeContentAndFindProduct = async (
           continue;
         }
 
+        const searchTerm = product.searchQuery || product.title || '';
+        const relevance = computeQueryRelevance(searchTerm, productData.title || '');
+        if (relevance < 0.3) {
+          continue;
+        }
+
         const insertionIndex = typeof product.paragraphNumber === 'number' ? product.paragraphNumber : 0;
         const productTitle = productData.title || product.title || product.searchQuery;
         const fallbackImage = hasImage
@@ -2219,10 +2230,14 @@ export const analyzeContentAndFindProduct = async (
           }
 
           if (productData.asin) {
+            const relevance = computeQueryRelevance(p1.name, productData.title || '');
+            if (relevance < 0.3 && !p1.asin) {
+              continue;
+            }
             const hasImage = !!productData.imageUrl;
             const hasValidPrice = productData.price && productData.price !== '$XX.XX';
             fallbackProducts.push({
-              id: `fallback-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+              id: `fallback-${crypto.randomUUID()}`,
               title: productData.title || p1.name,
               asin: productData.asin,
               price: hasValidPrice ? productData.price! : 'See Price',
@@ -2609,6 +2624,38 @@ const callSerpApiProxy = async (params: {
   throw lastError || new SerpApiError('SerpAPI proxy failed after retries', 500, false);
 };
 
+function computeQueryRelevance(query: string, resultTitle: string): number {
+  if (!query || !resultTitle) return 0;
+
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  const nQuery = normalize(query);
+  const nTitle = normalize(resultTitle);
+
+  if (nTitle.includes(nQuery) || nQuery.includes(nTitle)) return 1.0;
+
+  const STOP_WORDS = new Set(['the', 'a', 'an', 'and', 'or', 'for', 'with', 'in', 'on', 'of', 'to', 'by', 'is', 'at', 'it', 'new', 'best', 'top']);
+  const queryWords = nQuery.split(' ').filter(w => w.length > 1 && !STOP_WORDS.has(w));
+  const titleWords = new Set(nTitle.split(' ').filter(w => w.length > 1));
+
+  if (queryWords.length === 0) return 0;
+
+  let matchCount = 0;
+  for (const qw of queryWords) {
+    if (titleWords.has(qw)) {
+      matchCount++;
+    } else {
+      for (const tw of titleWords) {
+        if (tw.includes(qw) || qw.includes(tw)) {
+          matchCount += 0.7;
+          break;
+        }
+      }
+    }
+  }
+
+  return matchCount / queryWords.length;
+}
+
 const extractPrice = (result: any): string => {
   const priceFields = [
     result.buybox_winner?.price?.raw,
@@ -2729,7 +2776,28 @@ export const searchAmazonProduct = async (
     return {};
   }
 
-  const result = allResults.find(r => r.asin && (extractImage(r) || r.thumbnail)) || allResults[0];
+  const MIN_RELEVANCE = 0.35;
+
+  const scored = allResults
+    .filter((r: any) => r.asin)
+    .map((r: any) => ({
+      result: r,
+      relevance: computeQueryRelevance(query, r.title || ''),
+      hasImage: !!(extractImage(r) || r.thumbnail),
+      hasPrice: !!(extractPrice(r) !== '$XX.XX'),
+    }))
+    .sort((a, b) => {
+      if (Math.abs(a.relevance - b.relevance) > 0.15) return b.relevance - a.relevance;
+      if (a.hasImage !== b.hasImage) return a.hasImage ? -1 : 1;
+      return 0;
+    });
+
+  const bestMatch = scored.find(s => s.relevance >= MIN_RELEVANCE && (s.hasImage || s.hasPrice));
+  if (!bestMatch) {
+    return {};
+  }
+
+  const result = bestMatch.result;
 
   const product: Partial<ProductDetails> = {
     asin: result.asin || '',
